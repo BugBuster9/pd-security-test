@@ -60,6 +60,7 @@ import (
 	"github.com/tikv/pd/pkg/member"
 	"github.com/tikv/pd/pkg/ratelimit"
 	"github.com/tikv/pd/pkg/replication"
+	"github.com/tikv/pd/pkg/schedule/affinity"
 	sc "github.com/tikv/pd/pkg/schedule/config"
 	"github.com/tikv/pd/pkg/schedule/hbstream"
 	"github.com/tikv/pd/pkg/schedule/placement"
@@ -1426,7 +1427,7 @@ func (s *Server) IsServiceIndependent(name string) bool {
 }
 
 // DirectlyGetRaftCluster returns raft cluster directly.
-// Only used for test.
+// It bypasses the leader-running check for follower-local paths and tests.
 func (s *Server) DirectlyGetRaftCluster() *cluster.RaftCluster {
 	return s.cluster
 }
@@ -2155,4 +2156,17 @@ func (s *Server) SetClient(client *clientv3.Client) {
 // It only is used for test.
 func (s *Server) GetGlobalTSOAllocator() tso.Allocator {
 	return s.cluster.GetGlobalTSOAllocator()
+}
+
+// GetAffinityManager gets the affinity manager.
+func (s *Server) GetAffinityManager() (*affinity.Manager, error) {
+	rc := s.GetRaftCluster()
+	if rc == nil {
+		return nil, errs.ErrNotBootstrapped.GenWithStackByArgs()
+	}
+	manager := rc.GetAffinityManager()
+	if manager == nil {
+		return nil, errs.ErrAffinityInternal
+	}
+	return manager, nil
 }

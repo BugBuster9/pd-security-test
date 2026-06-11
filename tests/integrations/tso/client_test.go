@@ -26,10 +26,14 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/log"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	pd "github.com/tikv/pd/client"
-	"github.com/tikv/pd/client/testutil"
+	"github.com/tikv/pd/client/clients/tso"
+	"github.com/tikv/pd/client/opt"
+	"github.com/tikv/pd/client/pkg/utils/testutil"
+	sd "github.com/tikv/pd/client/servicediscovery"
 	bs "github.com/tikv/pd/pkg/basicserver"
 	"github.com/tikv/pd/pkg/mcs/utils/constant"
 	"github.com/tikv/pd/pkg/slice"
@@ -145,9 +149,9 @@ func (suite *tsoClientTestSuite) SetupSuite() {
 func (suite *tsoClientTestSuite) SetupTest() {
 	re := suite.Require()
 	if suite.legacy {
-		client, err := pd.NewClientWithContext(suite.ctx, suite.getBackendEndpoints(), pd.SecurityOption{}, pd.WithForwardingOption(true))
+		client, err := pd.NewClientWithContext(suite.ctx, suite.getBackendEndpoints(), pd.SecurityOption{}, opt.WithForwardingOption(true))
 		re.NoError(err)
-		innerClient, ok := client.(interface{ GetServiceDiscovery() pd.ServiceDiscovery })
+		innerClient, ok := client.(interface{ GetServiceDiscovery() sd.ServiceDiscovery })
 		re.True(ok)
 		re.Equal(constant.NullKeyspaceID, innerClient.GetServiceDiscovery().GetKeyspaceID())
 		re.Equal(constant.DefaultKeyspaceGroupID, innerClient.GetServiceDiscovery().GetKeyspaceGroupID())
@@ -233,7 +237,7 @@ func (suite *tsoClientTestSuite) TestGetTSAsync() {
 		for _, client := range suite.clients {
 			go func(client pd.Client) {
 				defer wg.Done()
-				tsFutures := make([]pd.TSFuture, tsoRequestRound)
+				tsFutures := make([]tso.TSFuture, tsoRequestRound)
 				for j := range tsFutures {
 					tsFutures[j] = client.GetTSAsync(suite.ctx)
 				}
@@ -259,11 +263,11 @@ func (suite *tsoClientTestSuite) TestDiscoverTSOServiceWithLegacyPath() {
 	failpointValue := fmt.Sprintf(`return(%d)`, keyspaceID)
 	// Simulate the case that the server has lower version than the client and returns no tso addrs
 	// in the GetClusterInfo RPC.
-	re.NoError(failpoint.Enable("github.com/tikv/pd/client/serverReturnsNoTSOAddrs", `return(true)`))
-	re.NoError(failpoint.Enable("github.com/tikv/pd/client/unexpectedCallOfFindGroupByKeyspaceID", failpointValue))
+	re.NoError(failpoint.Enable("github.com/tikv/pd/client/servicediscovery/serverReturnsNoTSOAddrs", `return(true)`))
+	re.NoError(failpoint.Enable("github.com/tikv/pd/client/servicediscovery/unexpectedCallOfFindGroupByKeyspaceID", failpointValue))
 	defer func() {
-		re.NoError(failpoint.Disable("github.com/tikv/pd/client/serverReturnsNoTSOAddrs"))
-		re.NoError(failpoint.Disable("github.com/tikv/pd/client/unexpectedCallOfFindGroupByKeyspaceID"))
+		re.NoError(failpoint.Disable("github.com/tikv/pd/client/servicediscovery/serverReturnsNoTSOAddrs"))
+		re.NoError(failpoint.Disable("github.com/tikv/pd/client/servicediscovery/unexpectedCallOfFindGroupByKeyspaceID"))
 	}()
 
 	ctx, cancel := context.WithCancel(suite.ctx)
@@ -313,14 +317,14 @@ func (suite *tsoClientTestSuite) TestGetMinTS() {
 	}
 	wg.Wait()
 
-	re.NoError(failpoint.Enable("github.com/tikv/pd/client/unreachableNetwork1", "return(true)"))
+	re.NoError(failpoint.Enable("github.com/tikv/pd/client/servicediscovery/unreachableNetwork1", "return(true)"))
 	time.Sleep(time.Second)
 	testutil.Eventually(re, func() bool {
 		var err error
 		_, _, err = suite.clients[0].GetMinTS(suite.ctx)
 		return err == nil
 	})
-	re.NoError(failpoint.Disable("github.com/tikv/pd/client/unreachableNetwork1"))
+	re.NoError(failpoint.Disable("github.com/tikv/pd/client/servicediscovery/unreachableNetwork1"))
 }
 
 // More details can be found in this issue: https://github.com/tikv/pd/issues/4884
@@ -439,7 +443,7 @@ func (suite *tsoClientTestSuite) TestRandomShutdown() {
 
 func (suite *tsoClientTestSuite) TestGetTSWhileResettingTSOClient() {
 	re := suite.Require()
-	re.NoError(failpoint.Enable("github.com/tikv/pd/client/delayDispatchTSORequest", "return(true)"))
+	re.NoError(failpoint.Enable("github.com/tikv/pd/client/clients/tso/delayDispatchTSORequest", "return(true)"))
 	var (
 		stopSignal atomic.Bool
 		wg         sync.WaitGroup
@@ -472,7 +476,7 @@ func (suite *tsoClientTestSuite) TestGetTSWhileResettingTSOClient() {
 	}
 	stopSignal.Store(true)
 	wg.Wait()
-	re.NoError(failpoint.Disable("github.com/tikv/pd/client/delayDispatchTSORequest"))
+	re.NoError(failpoint.Disable("github.com/tikv/pd/client/clients/tso/delayDispatchTSORequest"))
 }
 
 func TestTSOFollowerProxyWhenLeaderChanged(t *testing.T) {
@@ -489,10 +493,10 @@ func TestTSOFollowerProxyWhenLeaderChanged(t *testing.T) {
 	pdLeader := pdCluster.GetServer(leaderName)
 	backendEndpoints := pdLeader.GetAddr()
 	pdClient, err := pd.NewClientWithContext(context.Background(),
-		[]string{backendEndpoints}, pd.SecurityOption{}, pd.WithMaxErrorRetry(1))
+		[]string{backendEndpoints}, pd.SecurityOption{}, opt.WithMaxErrorRetry(1))
 	re.NoError(err)
 	defer pdClient.Close()
-	re.NoError(pdClient.UpdateOption(pd.EnableTSOFollowerProxy, true))
+	re.NoError(pdClient.UpdateOption(opt.EnableTSOFollowerProxy, true))
 	// client can get ts response after pd leader changed
 	re.NoError(pdLeader.ResignLeader())
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -528,7 +532,7 @@ func TestTSONotLeader(t *testing.T) {
 	pdLeader := pdCluster.GetServer(leaderName)
 	backendEndpoints := pdLeader.GetAddr()
 	pdClient, err := pd.NewClientWithContext(context.Background(),
-		[]string{backendEndpoints}, pd.SecurityOption{}, pd.WithMaxErrorRetry(1))
+		[]string{backendEndpoints}, pd.SecurityOption{}, opt.WithMaxErrorRetry(1))
 	re.NoError(err)
 	defer pdClient.Close()
 	re.NoError(failpoint.Enable("github.com/tikv/pd/server/rebaseErr", "return(true)"))
@@ -552,10 +556,10 @@ func TestMixedTSODeployment(t *testing.T) {
 	re := require.New(t)
 
 	re.NoError(failpoint.Enable("github.com/tikv/pd/pkg/tso/fastUpdatePhysicalInterval", "return(true)"))
-	re.NoError(failpoint.Enable("github.com/tikv/pd/client/skipUpdateServiceMode", "return(true)"))
+	re.NoError(failpoint.Enable("github.com/tikv/pd/client/servicediscovery/skipUpdateServiceMode", "return(true)"))
 	defer func() {
 		re.NoError(failpoint.Disable("github.com/tikv/pd/pkg/tso/fastUpdatePhysicalInterval"))
-		re.NoError(failpoint.Disable("github.com/tikv/pd/client/skipUpdateServiceMode"))
+		re.NoError(failpoint.Disable("github.com/tikv/pd/client/servicediscovery/skipUpdateServiceMode"))
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -615,9 +619,9 @@ func TestUpgradingAPIandTSOClusters(t *testing.T) {
 	backendEndpoints := pdLeader.GetAddr()
 
 	// Create a pd client in PD mode to let the API leader to forward requests to the TSO cluster.
-	re.NoError(failpoint.Enable("github.com/tikv/pd/client/usePDServiceMode", "return(true)"))
+	re.NoError(failpoint.Enable("github.com/tikv/pd/client/servicediscovery/usePDServiceMode", "return(true)"))
 	pdClient, err := pd.NewClientWithContext(context.Background(),
-		[]string{backendEndpoints}, pd.SecurityOption{}, pd.WithMaxErrorRetry(1))
+		[]string{backendEndpoints}, pd.SecurityOption{}, opt.WithMaxErrorRetry(1))
 	re.NoError(err)
 	defer pdClient.Close()
 
@@ -643,7 +647,7 @@ func TestUpgradingAPIandTSOClusters(t *testing.T) {
 	tsoCluster.Destroy()
 	apiCluster.Destroy()
 	cancel()
-	re.NoError(failpoint.Disable("github.com/tikv/pd/client/usePDServiceMode"))
+	re.NoError(failpoint.Disable("github.com/tikv/pd/client/servicediscovery/usePDServiceMode"))
 }
 
 func checkTSO(
@@ -712,7 +716,7 @@ func TestTSOServiceDiscovery(t *testing.T) {
 }
 
 func checkServiceDiscovery(re *require.Assertions, client pd.Client, urlsLen int) {
-	inner, ok := client.(interface{ GetTSOServiceDiscovery() pd.ServiceDiscovery })
+	inner, ok := client.(interface{ GetTSOServiceDiscovery() sd.ServiceDiscovery })
 	if ok {
 		tsoDiscovery := inner.GetTSOServiceDiscovery()
 		err := tsoDiscovery.CheckMemberChanged()
@@ -721,5 +725,112 @@ func checkServiceDiscovery(re *require.Assertions, client pd.Client, urlsLen int
 			urls := tsoDiscovery.(interface{ GetURLs() []string }).GetURLs()
 			re.Len(urls, urlsLen)
 		}
+	}
+}
+
+// Race condition test between TSO request dispatcher and background connection updater
+
+// Connection updater view:
+// 1.1. Builds a stream A for TSO primary upon initialization.
+// 1.2. Store the stream A into connection context manager.
+
+// Request dispatcher view:
+// 2.1. Upon no stream ready, builds a stream B for TSO primary.
+// 2.2. Process the requests via stream B.
+
+// Race timeline:
+// 1.1. Creates stream A but haven't registered it.
+// 2.1. Creates stream B and registers it to the connection context manager.
+// 1.2. Registered stream A and cancelled the context of stream B.
+// 2.2. Observes canceled context of stream B.
+func (suite *tsoClientTestSuite) TestTSOStreamSetupRace() {
+	if !suite.legacy {
+		suite.T().Skip("race is in tryConnectToTSO, which is the non-proxy path")
+	}
+	re := suite.Require()
+
+	const tsoFailpointPrefix = "github.com/tikv/pd/client/clients/tso/"
+
+	backgroundBeforeStore := make(chan struct{})
+	releaseBackgroundStore := make(chan struct{})
+
+	re.NoError(failpoint.EnableCall(tsoFailpointPrefix+"pauseBeforeBackgroundStoreTSOLeaderStream", func() {
+		log.Info("[tso race] 1.1.1 pause background goroutine before CleanAllAndStore")
+		close(backgroundBeforeStore)
+		<-releaseBackgroundStore
+		log.Info("[tso race] 1.2.1 released pause for CleanAllAndStore")
+	}))
+	defer func() {
+		re.NoError(failpoint.Disable(tsoFailpointPrefix + "pauseBeforeBackgroundStoreTSOLeaderStream"))
+	}()
+
+	ctx, cancel := context.WithCancel(suite.ctx)
+	pdClient, err := pd.NewClientWithContext(ctx, suite.getBackendEndpoints(), pd.SecurityOption{})
+	re.NoError(err)
+
+	safeClose := func(ch chan struct{}) {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+	defer func() {
+		safeClose(releaseBackgroundStore)
+		pdClient.Close()
+		cancel()
+	}()
+
+	waitFor := func(ch <-chan struct{}, desc string) {
+		select {
+		case <-ch:
+			log.Info("[tso race] " + desc)
+		case <-time.After(30 * time.Second):
+			re.Failf("timed out", "timed out waiting for: %s", desc)
+		}
+	}
+	waitFor(backgroundBeforeStore, "1.1.2 background goroutine reaching CleanAllAndStore")
+
+	re.NoError(failpoint.Disable(tsoFailpointPrefix + "pauseBeforeBackgroundStoreTSOLeaderStream"))
+
+	requestAttachedToStream := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	defer func() {
+		safeClose(releaseRequest)
+	}()
+
+	re.NoError(failpoint.EnableCall(tsoFailpointPrefix+"pauseAfterTSORequestAttachedToStream", func() {
+		log.Info("[tso race] 2.1.1 pausing tso request after attached to stream")
+		close(requestAttachedToStream)
+		<-releaseRequest
+		log.Info("[tso race] 2.2.2 tso request released")
+	}))
+	defer func() {
+		re.NoError(failpoint.Disable(tsoFailpointPrefix + "pauseAfterTSORequestAttachedToStream"))
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := pdClient.GetTS(context.Background())
+		errCh <- err
+	}()
+
+	waitFor(requestAttachedToStream, "2.1.2 request attached to dispatcher's stream")
+
+	re.NoError(failpoint.EnableCall(tsoFailpointPrefix+"notifyAfterBackgroundStoreTSOLeaderStream", func() {
+		log.Info("[tso race] 1.2.2 background goroutine finished CleanAllAndStore")
+		close(releaseRequest)
+		log.Info("[tso race] 2.2.1 releasing pause for TSO request")
+	}))
+	defer func() {
+		re.NoError(failpoint.Disable(tsoFailpointPrefix + "notifyAfterBackgroundStoreTSOLeaderStream"))
+	}()
+
+	close(releaseBackgroundStore)
+	select {
+	case err := <-errCh:
+		re.NoError(err)
+	case <-time.After(30 * time.Second):
+		re.Failf("timed out", "GetTS has not returned")
 	}
 }

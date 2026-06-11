@@ -155,6 +155,17 @@ func (t *regionTree) overlaps(item *regionItem) []*RegionInfo {
 	return overlaps
 }
 
+// updateRef transfers the reference from origin to region when an item is
+// replaced in place, i.e. the tree keeps the same item and only its embedded
+// RegionInfo changes. It is a no-op for trees that do not count references.
+func (t *regionTree) updateRef(origin, region *RegionInfo) {
+	if !t.countRef {
+		return
+	}
+	origin.DecRef()
+	region.IncRef()
+}
+
 // update updates the tree with the region.
 // It finds and deletes all the overlapped regions first, and then
 // insert the region.
@@ -222,10 +233,7 @@ func (t *regionTree) updateStat(origin *RegionInfo, region *RegionInfo) {
 	if !origin.LoadedFromStorage() && region.LoadedFromStorage() {
 		t.notFromStorageRegionsCnt--
 	}
-	if t.countRef {
-		origin.DecRef()
-		region.IncRef()
-	}
+	t.updateRef(origin, region)
 }
 
 // remove removes a region if the region is in the tree.
@@ -279,6 +287,26 @@ func (t *regionTree) searchPrev(regionKey []byte) *RegionInfo {
 		return nil
 	}
 	return prevRegionItem.RegionInfo
+}
+
+// searchByKeys searches the regions by keys and return a slice of `*RegionInfo` whose order is the same as the input keys.
+func (t *regionTree) searchByKeys(keys [][]byte) []*RegionInfo {
+	regions := make([]*RegionInfo, len(keys))
+	// TODO: do we need to deduplicate the input keys?
+	for idx, key := range keys {
+		regions[idx] = t.search(key)
+	}
+	return regions
+}
+
+// searchByPrevKeys searches the regions by prevKeys and return a slice of `*RegionInfo` whose order is the same as the input keys.
+func (t *regionTree) searchByPrevKeys(prevKeys [][]byte) []*RegionInfo {
+	regions := make([]*RegionInfo, len(prevKeys))
+	// TODO: do we need to deduplicate the input keys?
+	for idx, key := range prevKeys {
+		regions[idx] = t.searchPrev(key)
+	}
+	return regions
 }
 
 // find returns the range item contains the start key.

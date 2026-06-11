@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -94,6 +93,10 @@ type Controller struct {
 	// safe for concurrent.
 	opNotifierQueue *concurrentHeapOpQueue
 
+	// successCallbacks are called when an operator completes successfully.
+	// Set during initialization, read-only afterwards (no lock needed).
+	successCallbacks []func(op *Operator)
+
 	// states
 	records   *records // safe for concurrent
 	wop       WaitingOperator
@@ -110,12 +113,20 @@ func NewController(ctx context.Context, cluster *core.BasicCluster, config confi
 		hbStreams:       hbStreams,
 		fastOperators:   cache.NewIDTTL(ctx, time.Minute, FastOperatorFinishTime),
 		opNotifierQueue: newConcurrentHeapOpQueue(),
+
+		successCallbacks: nil, // Will be set by coordinator
 		// states
 		records:   newRecords(ctx),
 		wop:       newRandBuckets(),
 		wopStatus: newWaitingOperatorStatus(),
 		counts:    &opCounter{count: make(map[OpKind]uint64)},
 	}
+}
+
+// SetSuccessCallbacks sets callbacks for operator success.
+// Must be called before the controller starts running.
+func (oc *Controller) SetSuccessCallbacks(callbacks ...func(op *Operator)) {
+	oc.successCallbacks = callbacks
 }
 
 // Ctx returns a context which will be canceled once RaftCluster is stopped.
@@ -155,6 +166,11 @@ func (oc *Controller) Dispatch(region *core.RegionInfo, source string, recordOpS
 		case SUCCESS:
 			if op.ContainNonWitnessStep() {
 				recordOpStepWithTTL(op.RegionID())
+			}
+			for _, callback := range oc.successCallbacks {
+				if callback != nil {
+					callback(op)
+				}
 			}
 			if oc.RemoveOperator(op) {
 				operatorCounter.WithLabelValues(op.Desc(), "promote-success").Inc()
@@ -301,13 +317,13 @@ func (oc *Controller) AddWaitingOperator(ops ...*Operator) int {
 		op := ops[i]
 		desc := op.Desc()
 		isMerge := false
-		if op.Kind()&OpMerge != 0 {
+		if op.HasRelatedMergeRegion() {
 			if i+1 >= len(ops) {
 				// should not be here forever
 				log.Error("orphan merge operators found", zap.String("desc", desc), errs.ZapError(errs.ErrMergeOperator.FastGenByArgs("orphan operator found")))
 				return added
 			}
-			if ops[i+1].Kind()&OpMerge == 0 {
+			if !ops[i+1].HasRelatedMergeRegion() {
 				log.Error("merge operator should be paired", zap.String("desc",
 					ops[i+1].Desc()), errs.ZapError(errs.ErrMergeOperator.FastGenByArgs("operator should be paired")))
 				return added
@@ -496,7 +512,7 @@ func (oc *Controller) checkOperatorLightly(op *Operator) (*core.RegionInfo, Canc
 	// But to be cautions, it only takes effect on merge-region currently.
 	// If the version of epoch is changed, the region has been splitted or merged, and the key range has been changed.
 	// The changing for conf_version of epoch doesn't modify the region key range, skip it.
-	if (op.Kind()&OpMerge != 0) && region.GetRegionEpoch().GetVersion() > op.RegionEpoch().GetVersion() {
+	if op.HasRelatedMergeRegion() && region.GetRegionEpoch().GetVersion() > op.RegionEpoch().GetVersion() {
 		operatorCounter.WithLabelValues(op.Desc(), "epoch-not-match").Inc()
 		return nil, EpochNotMatch
 	}
@@ -620,7 +636,7 @@ func (oc *Controller) removeOperatorsInner() []*Operator {
 		oc.counts.dec(op.SchedulerKind())
 		operatorCounter.WithLabelValues(op.Desc(), "remove").Inc()
 		oc.ack(op)
-		if op.Kind()&OpMerge != 0 {
+		if op.HasRelatedMergeRegion() {
 			oc.removeRelatedMergeOperator(op)
 		}
 		removed = append(removed, op)
@@ -659,7 +675,7 @@ func (oc *Controller) removeOperatorInner(op *Operator) bool {
 		oc.counts.dec(op.SchedulerKind())
 		operatorCounter.WithLabelValues(op.Desc(), "remove").Inc()
 		oc.ack(op)
-		if op.Kind()&OpMerge != 0 {
+		if op.HasRelatedMergeRegion() {
 			oc.removeRelatedMergeOperator(op)
 		}
 		return true
@@ -668,7 +684,10 @@ func (oc *Controller) removeOperatorInner(op *Operator) bool {
 }
 
 func (oc *Controller) removeRelatedMergeOperator(op *Operator) {
-	relatedID, _ := strconv.ParseUint(op.GetAdditionalInfo(string(RelatedMergeRegion)), 10, 64)
+	relatedID := op.GetRelatedMergeRegion()
+	if relatedID == 0 {
+		return
+	}
 	relatedOpi, ok := oc.operators.Load(relatedID)
 	if !ok {
 		return
@@ -845,6 +864,9 @@ type OpInfluenceOption func(region *core.RegionInfo) bool
 // WithRangeOption returns an OpInfluenceOption that filters the region by the key ranges.
 func WithRangeOption(ranges []keyutil.KeyRange) OpInfluenceOption {
 	return func(region *core.RegionInfo) bool {
+		if region == nil {
+			return false
+		}
 		kr := keyutil.NewKeyRange(string(region.GetStartKey()), string(region.GetEndKey()))
 		for _, r := range ranges {
 			// exclude the continued range
@@ -867,17 +889,23 @@ func (oc *Controller) GetOpInfluence(cluster *core.BasicCluster, ops ...OpInflue
 	influence := &OpInfluence{
 		StoresInfluence: make(map[uint64]*StoreInfluence),
 	}
+	if cluster == nil {
+		return influence
+	}
 	oc.operators.Range(
 		func(_, value any) bool {
 			op := value.(*Operator)
 			if !op.CheckTimeout() && !op.CheckSuccess() {
 				region := cluster.GetRegion(op.RegionID())
-				for _, opt := range ops {
-					if !opt(region) {
-						return true
-					}
-				}
 				if region != nil {
+					for _, opt := range ops {
+						if opt == nil {
+							continue
+						}
+						if !opt(region) {
+							return true
+						}
+					}
 					op.UnfinishedInfluence(influence, region)
 				}
 			}

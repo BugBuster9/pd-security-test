@@ -209,8 +209,8 @@ func CreateMergeRegionOperator(desc string, ci sche.SharedCluster, source *core.
 	})
 
 	brief := fmt.Sprintf("merge: region %v to %v", source.GetID(), target.GetID())
-	op1 := NewOperator(desc, brief, source.GetID(), source.GetRegionEpoch(), kind|OpMerge, source.GetApproximateSize(), steps...)
-	op2 := NewOperator(desc, brief, target.GetID(), target.GetRegionEpoch(), kind|OpMerge, target.GetApproximateSize(), MergeRegion{
+	op1 := NewOperator(desc, brief, source.GetID(), source.GetRegionEpoch(), kind, source.GetApproximateSize(), steps...)
+	op2 := NewOperator(desc, brief, target.GetID(), target.GetRegionEpoch(), kind, target.GetApproximateSize(), MergeRegion{
 		FromRegion: source.GetMeta(),
 		ToRegion:   target.GetMeta(),
 		IsPassive:  true,
@@ -235,6 +235,16 @@ func isRegionMatch(a, b *core.RegionInfo) bool {
 
 // CreateScatterRegionOperator creates an operator that scatters the specified region.
 func CreateScatterRegionOperator(desc string, ci sche.SharedCluster, origin *core.RegionInfo, targetPeers map[uint64]*metapb.Peer, targetLeader uint64, skipLimitCheck bool) (*Operator, error) {
+	return newScatterRegionOperator(desc, ci, origin, targetPeers, targetLeader, skipLimitCheck, OpAdmin)
+}
+
+// CreateNonAdminScatterRegionOperator creates a scatter operator for internal
+// split-scatter background flows.
+func CreateNonAdminScatterRegionOperator(desc string, ci sche.SharedCluster, origin *core.RegionInfo, targetPeers map[uint64]*metapb.Peer, targetLeader uint64, skipLimitCheck bool) (*Operator, error) {
+	return newScatterRegionOperator(desc, ci, origin, targetPeers, targetLeader, skipLimitCheck, OpSplitScatter)
+}
+
+func newScatterRegionOperator(desc string, ci sche.SharedCluster, origin *core.RegionInfo, targetPeers map[uint64]*metapb.Peer, targetLeader uint64, skipLimitCheck bool, kind OpKind) (*Operator, error) {
 	// randomly pick a leader.
 	var ids []uint64
 	for id, peer := range targetPeers {
@@ -255,13 +265,16 @@ func CreateScatterRegionOperator(desc string, ci sche.SharedCluster, origin *cor
 		builder.SetRemoveLightPeer()
 	}
 
-	return builder.
+	builder = builder.
 		SetPeers(targetPeers).
 		SetLeader(leader).
-		SetAddLightPeer().
-		// EnableForceTargetLeader in order to ignore the leader schedule limit
-		EnableForceTargetLeader().
-		Build(OpAdmin)
+		SetAddLightPeer()
+	if kind&OpAdmin != 0 {
+		// Admin scatter keeps the historical behavior: force the selected
+		// target leader so manual scatter can bypass leader scheduling limits.
+		builder.EnableForceTargetLeader()
+	}
+	return builder.Build(kind)
 }
 
 // OpDescLeaveJointState is the expected desc for LeaveJointStateOperator.

@@ -606,7 +606,7 @@ func (h *Handler) AddMergeRegionOperator(regionID uint64, targetID uint64) error
 		return errs.ErrRegionNotAdjacent
 	}
 
-	ops, err := operator.CreateMergeRegionOperator("admin-merge-region", c, region, target, operator.OpAdmin)
+	ops, err := operator.CreateMergeRegionOperator("admin-merge-region", c, region, target, operator.OpAdmin|operator.OpMerge)
 	if err != nil {
 		log.Debug("fail to create merge region operator", errs.ZapError(err))
 		return err
@@ -992,6 +992,7 @@ type HotStoreStats struct {
 	KeysReadStats   map[uint64]float64 `json:"keys-read-rate,omitempty"`
 	QueryWriteStats map[uint64]float64 `json:"query-write-rate,omitempty"`
 	QueryReadStats  map[uint64]float64 `json:"query-read-rate,omitempty"`
+	CPUReadStats    map[uint64]float64 `json:"cpu-read-rate,omitempty"`
 }
 
 // GetHotStores gets all hot stores stats.
@@ -1003,6 +1004,7 @@ func (h *Handler) GetHotStores() (*HotStoreStats, error) {
 		KeysReadStats:   make(map[uint64]float64),
 		QueryWriteStats: make(map[uint64]float64),
 		QueryReadStats:  make(map[uint64]float64),
+		CPUReadStats:    make(map[uint64]float64),
 	}
 	stores, error := h.GetStores()
 	if error != nil {
@@ -1026,6 +1028,7 @@ func (h *Handler) GetHotStores() (*HotStoreStats, error) {
 			stats.KeysReadStats[id] = loads[utils.StoreReadKeys]
 			stats.QueryWriteStats[id] = loads[utils.StoreWriteQuery]
 			stats.QueryReadStats[id] = loads[utils.StoreReadQuery]
+			stats.CPUReadStats[id] = loads[utils.StoreReadCPU]
 		}
 	}
 	return stats, nil

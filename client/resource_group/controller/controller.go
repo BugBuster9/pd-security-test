@@ -31,7 +31,9 @@ import (
 	"github.com/pingcap/log"
 	"github.com/prometheus/client_golang/prometheus"
 	pd "github.com/tikv/pd/client"
+	"github.com/tikv/pd/client/clients/metastorage"
 	"github.com/tikv/pd/client/errs"
+	"github.com/tikv/pd/client/opt"
 	"go.uber.org/zap"
 	"golang.org/x/exp/slices"
 )
@@ -85,11 +87,9 @@ type ResourceGroupProvider interface {
 	ModifyResourceGroup(ctx context.Context, metaGroup *rmpb.ResourceGroup) (string, error)
 	DeleteResourceGroup(ctx context.Context, resourceGroupName string) (string, error)
 	AcquireTokenBuckets(ctx context.Context, request *rmpb.TokenBucketsRequest) ([]*rmpb.TokenBucketResponse, error)
-
-	// meta storage client
 	LoadResourceGroups(ctx context.Context) ([]*rmpb.ResourceGroup, int64, error)
-	Watch(ctx context.Context, key []byte, opts ...pd.OpOption) (chan []*meta_storagepb.Event, error)
-	Get(ctx context.Context, key []byte, opts ...pd.OpOption) (*meta_storagepb.GetResponse, error)
+
+	metastorage.Client
 }
 
 // ResourceControlCreateOption create a ResourceGroupsController with the optional settings.
@@ -270,13 +270,13 @@ func (c *ResourceGroupsController) Start(ctx context.Context) {
 		var watchMetaChannel, watchConfigChannel chan []*meta_storagepb.Event
 		if !c.ruConfig.isSingleGroupByKeyspace {
 			// Use WithPrevKV() to get the previous key-value pair when get Delete Event.
-			watchMetaChannel, err = c.provider.Watch(ctx, pd.GroupSettingsPathPrefixBytes, pd.WithRev(metaRevision), pd.WithPrefix(), pd.WithPrevKV())
+			watchMetaChannel, err = c.provider.Watch(ctx, pd.GroupSettingsPathPrefixBytes, opt.WithRev(metaRevision), opt.WithPrefix(), opt.WithPrevKV())
 			if err != nil {
 				log.Warn("watch resource group meta failed", zap.Error(err))
 			}
 		}
 
-		watchConfigChannel, err = c.provider.Watch(ctx, pd.ControllerConfigPathPrefixBytes, pd.WithRev(cfgRevision), pd.WithPrefix())
+		watchConfigChannel, err = c.provider.Watch(ctx, pd.ControllerConfigPathPrefixBytes, opt.WithRev(cfgRevision), opt.WithPrefix())
 		if err != nil {
 			log.Warn("watch resource group config failed", zap.Error(err))
 		}
@@ -297,7 +297,7 @@ func (c *ResourceGroupsController) Start(ctx context.Context) {
 			case <-watchRetryTimer.C:
 				if !c.ruConfig.isSingleGroupByKeyspace && watchMetaChannel == nil {
 					// Use WithPrevKV() to get the previous key-value pair when get Delete Event.
-					watchMetaChannel, err = c.provider.Watch(ctx, pd.GroupSettingsPathPrefixBytes, pd.WithRev(metaRevision), pd.WithPrefix(), pd.WithPrevKV())
+					watchMetaChannel, err = c.provider.Watch(ctx, pd.GroupSettingsPathPrefixBytes, opt.WithRev(metaRevision), opt.WithPrefix(), opt.WithPrevKV())
 					if err != nil {
 						log.Warn("watch resource group meta failed", zap.Error(err))
 						watchRetryTimer.Reset(watchRetryInterval)
@@ -307,7 +307,7 @@ func (c *ResourceGroupsController) Start(ctx context.Context) {
 					}
 				}
 				if watchConfigChannel == nil {
-					watchConfigChannel, err = c.provider.Watch(ctx, pd.ControllerConfigPathPrefixBytes, pd.WithRev(cfgRevision), pd.WithPrefix())
+					watchConfigChannel, err = c.provider.Watch(ctx, pd.ControllerConfigPathPrefixBytes, opt.WithRev(cfgRevision), opt.WithPrefix())
 					if err != nil {
 						log.Warn("watch resource group config failed", zap.Error(err))
 						watchRetryTimer.Reset(watchRetryInterval)
@@ -822,6 +822,8 @@ type tokenCounter struct {
 		setupNotificationCh        <-chan time.Time
 		setupNotificationThreshold float64
 		setupNotificationTimer     *time.Timer
+		// cancelCh wakes up handleTokenBucketUpdateEvent when the timer is stopped.
+		cancelCh chan struct{}
 	}
 
 	lastDeadline time.Time
@@ -989,18 +991,27 @@ func (gc *groupCostController) handleTokenBucketUpdateEvent(ctx context.Context)
 		for _, counter := range gc.run.resourceTokens {
 			counter.notify.mu.Lock()
 			ch := counter.notify.setupNotificationCh
+			cancelCh := counter.notify.cancelCh
 			counter.notify.mu.Unlock()
-			if ch == nil {
+			if ch == nil || cancelCh == nil {
 				continue
 			}
 			select {
 			case <-ch:
 				counter.notify.mu.Lock()
-				counter.notify.setupNotificationTimer = nil
-				counter.notify.setupNotificationCh = nil
+				if counter.notify.setupNotificationCh != ch || counter.notify.cancelCh != cancelCh {
+					counter.notify.mu.Unlock()
+					return
+				}
 				threshold := counter.notify.setupNotificationThreshold
-				counter.notify.mu.Unlock()
+				cancelCh = resetCounterNotifyLocked(counter)
 				counter.limiter.SetupNotificationThreshold(threshold)
+				counter.notify.mu.Unlock()
+				if cancelCh != nil {
+					close(cancelCh)
+				}
+			case <-cancelCh:
+				return
 			case <-ctx.Done():
 				return
 			}
@@ -1010,18 +1021,27 @@ func (gc *groupCostController) handleTokenBucketUpdateEvent(ctx context.Context)
 		for _, counter := range gc.run.requestUnitTokens {
 			counter.notify.mu.Lock()
 			ch := counter.notify.setupNotificationCh
+			cancelCh := counter.notify.cancelCh
 			counter.notify.mu.Unlock()
-			if ch == nil {
+			if ch == nil || cancelCh == nil {
 				continue
 			}
 			select {
 			case <-ch:
 				counter.notify.mu.Lock()
-				counter.notify.setupNotificationTimer = nil
-				counter.notify.setupNotificationCh = nil
+				if counter.notify.setupNotificationCh != ch || counter.notify.cancelCh != cancelCh {
+					counter.notify.mu.Unlock()
+					return
+				}
 				threshold := counter.notify.setupNotificationThreshold
-				counter.notify.mu.Unlock()
+				cancelCh = resetCounterNotifyLocked(counter)
 				counter.limiter.SetupNotificationThreshold(threshold)
+				counter.notify.mu.Unlock()
+				if cancelCh != nil {
+					close(cancelCh)
+				}
+			case <-cancelCh:
+				return
 			case <-ctx.Done():
 				return
 			}
@@ -1217,6 +1237,7 @@ func (gc *groupCostController) modifyTokenCounter(counter *tokenCounter, bucket 
 		}
 		counter.notify.setupNotificationTimer = time.NewTimer(timerDuration)
 		counter.notify.setupNotificationCh = counter.notify.setupNotificationTimer.C
+		counter.notify.cancelCh = make(chan struct{})
 		counter.notify.setupNotificationThreshold = 1
 		counter.notify.mu.Unlock()
 		counter.lastDeadline = deadline
@@ -1233,12 +1254,22 @@ func (gc *groupCostController) modifyTokenCounter(counter *tokenCounter, bucket 
 
 func initCounterNotify(counter *tokenCounter) {
 	counter.notify.mu.Lock()
+	cancelCh := resetCounterNotifyLocked(counter)
+	counter.notify.mu.Unlock()
+	if cancelCh != nil {
+		close(cancelCh)
+	}
+}
+
+func resetCounterNotifyLocked(counter *tokenCounter) chan struct{} {
 	if counter.notify.setupNotificationTimer != nil {
 		counter.notify.setupNotificationTimer.Stop()
-		counter.notify.setupNotificationTimer = nil
-		counter.notify.setupNotificationCh = nil
 	}
-	counter.notify.mu.Unlock()
+	cancelCh := counter.notify.cancelCh
+	counter.notify.setupNotificationTimer = nil
+	counter.notify.setupNotificationCh = nil
+	counter.notify.cancelCh = nil
+	return cancelCh
 }
 
 func (gc *groupCostController) collectRequestAndConsumption(selectTyp selectType) *rmpb.TokenBucketRequest {
@@ -1343,8 +1374,9 @@ func (gc *groupCostController) acquireTokens(ctx context.Context, delta *rmpb.Co
 	gc.metrics.runningKVRequestCounter.Inc()
 	defer gc.metrics.runningKVRequestCounter.Dec()
 	var (
-		err error
-		d   time.Duration
+		err            error
+		d              time.Duration
+		reconfiguredCh <-chan struct{}
 	)
 retryLoop:
 	for range gc.mainCfg.WaitRetryTimes {
@@ -1363,6 +1395,7 @@ retryLoop:
 		case rmpb.GroupMode_RUMode:
 			res := make([]*Reservation, 0, len(requestUnitLimitTypeList))
 			for typ, counter := range gc.run.requestUnitTokens {
+				reconfiguredCh = counter.limiter.GetReconfiguredCh()
 				if v := getRUValueFromConsumption(delta, typ); v > 0 {
 					// record the consume token histogram if enable controller debug mode.
 					if enableControllerTraceLog.Load() {
@@ -1381,8 +1414,28 @@ retryLoop:
 			}
 		}
 		gc.metrics.requestRetryCounter.Inc()
-		time.Sleep(gc.mainCfg.WaitRetryInterval)
-		*waitDuration += gc.mainCfg.WaitRetryInterval
+		waitStart := time.Now()
+		waitTimer := time.NewTimer(gc.mainCfg.WaitRetryInterval)
+		select {
+		case <-ctx.Done():
+			if !waitTimer.Stop() {
+				select {
+				case <-waitTimer.C:
+				default:
+				}
+			}
+			*waitDuration += time.Since(waitStart)
+			return d, ctx.Err()
+		case <-reconfiguredCh:
+			if !waitTimer.Stop() {
+				select {
+				case <-waitTimer.C:
+				default:
+				}
+			}
+		case <-waitTimer.C:
+		}
+		*waitDuration += time.Since(waitStart)
 	}
 	return d, err
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/mcs/utils/constant"
 	"github.com/tikv/pd/pkg/ratelimit"
+	"github.com/tikv/pd/pkg/schedule/hbstream"
 	"github.com/tikv/pd/pkg/schedule/operator"
 	"github.com/tikv/pd/pkg/statistics/buckets"
 	"github.com/tikv/pd/pkg/utils/logutil"
@@ -133,7 +134,15 @@ func (c *RaftCluster) HandleAskBatchSplit(request *pdpb.AskBatchSplitRequest) (*
 	if repMode := c.GetReplicationMode(); repMode != nil && repMode.IsRegionSplitPaused() {
 		return nil, errors.New("region split is paused by replication mode")
 	}
+
+	region := c.GetRegion(reqRegion.GetId())
+	if affinityManager := c.GetAffinityManager(); affinityManager != nil && !affinityManager.AllowSplit(region, request.Reason) {
+		c.hbstreams.SendMsg(region, &hbstream.Operation{ChangeSplit: &pdpb.ChangeSplit{AutoSplitEnabled: false}})
+		return nil, errors.New("cannot split affinity region")
+	}
+
 	splitIDs := make([]*pdpb.SplitID, 0, splitCount)
+	newRegionIDs := make([]uint64, 0, splitCount)
 	recordRegions := make([]uint64, 0, splitCount+1)
 
 	for i := 0; i < int(splitCount); i++ {
@@ -149,6 +158,7 @@ func (c *RaftCluster) HandleAskBatchSplit(request *pdpb.AskBatchSplitRequest) (*
 			}
 		}
 
+		newRegionIDs = append(newRegionIDs, newRegionID)
 		recordRegions = append(recordRegions, newRegionID)
 		splitIDs = append(splitIDs, &pdpb.SplitID{
 			NewRegionId: newRegionID,
@@ -168,6 +178,14 @@ func (c *RaftCluster) HandleAskBatchSplit(request *pdpb.AskBatchSplitRequest) (*
 	// status may be left, and these regions need to be checked with higher
 	// priority.
 	c.AddPendingProcessedRegions(false, recordRegions...)
+	if request.GetReason() == pdpb.SplitReason_LOAD {
+		c.GetCoordinator().GetCheckerController().RecordSplitScatterBatch(
+			reqRegion.GetId(),
+			// Wait until PD observes the source region version advanced by the split.
+			reqRegion.GetRegionEpoch().GetVersion()+1,
+			newRegionIDs,
+		)
+	}
 
 	resp := &pdpb.AskBatchSplitResponse{Ids: splitIDs}
 

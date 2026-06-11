@@ -6,6 +6,51 @@ error = '''
 KMS error
 '''
 
+["PD:affinity:ErrAffinityGroupConflict"]
+error = '''
+affinity group %s cannot appear in both add and remove operations in the same request
+'''
+
+["PD:affinity:ErrAffinityGroupContent"]
+error = '''
+invalid affinity group content, %s
+'''
+
+["PD:affinity:ErrAffinityGroupExist"]
+error = '''
+affinity group %s already exists
+'''
+
+["PD:affinity:ErrAffinityGroupNotFound"]
+error = '''
+affinity group %s not found
+'''
+
+["PD:affinity:ErrAffinityInternal"]
+error = '''
+affinity internal error
+'''
+
+["PD:affinity:ErrEmptyRequest"]
+error = '''
+%s
+'''
+
+["PD:affinity:ErrInvalidGroupID"]
+error = '''
+invalid group id %s: should contain only letters (a-z, A-Z), numbers (0-9), hyphens (-) and underscores (_), and be 1-64 characters long
+'''
+
+["PD:affinity:ErrInvalidKeyFormat"]
+error = '''
+invalid hex %s key '%s' for group '%s'
+'''
+
+["PD:affinity:ErrInvalidLabelRuleFormat"]
+error = '''
+invalid label rule data format %s
+'''
+
 ["PD:apiutil:ErrOptionNotExist"]
 error = '''
 the option %s does not exist
@@ -94,11 +139,6 @@ get min TSO failed, %v
 ["PD:client:ErrClientGetTSO"]
 error = '''
 get TSO failed
-'''
-
-["PD:client:ErrClientGetTSOTimeout"]
-error = '''
-get TSO timeout
 '''
 
 ["PD:cluster:ErrInvalidStoreID"]
@@ -379,6 +419,11 @@ etcd transaction failed, conflicted and rolled back
 ["PD:etcd:ErrEtcdTxnInternal"]
 error = '''
 internal etcd transaction error occurred
+'''
+
+["PD:etcd:ErrEtcdTxnResponse"]
+error = '''
+etcd transaction returned unexpected response: %v
 '''
 
 ["PD:etcd:ErrEtcdURLMap"]

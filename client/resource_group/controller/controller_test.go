@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 	pd "github.com/tikv/pd/client"
 	"github.com/tikv/pd/client/errs"
+	"github.com/tikv/pd/client/opt"
 )
 
 func createTestGroupCostController(re *require.Assertions) *groupCostController {
@@ -161,6 +162,83 @@ func TestOnResponseWaitConsumption(t *testing.T) {
 	verify()
 }
 
+func TestHandleTokenBucketUpdateEventCanceledByInitCounterNotify(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+	counter := gc.run.requestUnitTokens[rmpb.RequestUnitType_RU]
+
+	counter.notify.mu.Lock()
+	counter.notify.setupNotificationTimer = time.NewTimer(time.Hour)
+	counter.notify.setupNotificationCh = counter.notify.setupNotificationTimer.C
+	counter.notify.setupNotificationThreshold = 1
+	counter.notify.cancelCh = make(chan struct{})
+	counter.notify.mu.Unlock()
+	defer initCounterNotify(counter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		gc.handleTokenBucketUpdateEvent(ctx)
+		close(done)
+	}()
+
+	require.Never(t, func() bool {
+		return isClosed(done)
+	}, 50*time.Millisecond, 5*time.Millisecond)
+
+	initCounterNotify(counter)
+	require.Eventually(t, func() bool {
+		return isClosed(done)
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestHandleTokenBucketUpdateEventCleansNotifyOnTimer(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+	counter := gc.run.requestUnitTokens[rmpb.RequestUnitType_RU]
+	threshold := 42.0
+
+	counter.notify.mu.Lock()
+	counter.notify.setupNotificationTimer = time.NewTimer(10 * time.Millisecond)
+	counter.notify.setupNotificationCh = counter.notify.setupNotificationTimer.C
+	counter.notify.setupNotificationThreshold = threshold
+	counter.notify.cancelCh = make(chan struct{})
+	counter.notify.mu.Unlock()
+	defer initCounterNotify(counter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		gc.handleTokenBucketUpdateEvent(ctx)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		return isClosed(done)
+	}, time.Second, 10*time.Millisecond)
+
+	counter.notify.mu.Lock()
+	re.Nil(counter.notify.setupNotificationTimer)
+	re.Nil(counter.notify.setupNotificationCh)
+	re.Nil(counter.notify.cancelCh)
+	counter.notify.mu.Unlock()
+
+	counter.limiter.mu.Lock()
+	re.Equal(threshold, counter.limiter.notifyThreshold)
+	counter.limiter.mu.Unlock()
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 func TestResourceGroupThrottledError(t *testing.T) {
 	re := require.New(t)
 	gc := createTestGroupCostController(re)
@@ -172,6 +250,162 @@ func TestResourceGroupThrottledError(t *testing.T) {
 	_, _, _, _, err := gc.onRequestWaitImpl(context.TODO(), req)
 	re.Error(err)
 	re.True(errs.ErrClientResourceGroupThrottled.Equal(err))
+}
+
+func TestAcquireTokensSignalAwareWait(t *testing.T) {
+	re := require.New(t)
+
+	// Build controller with a buffered lowRUNotifyChan so the test can
+	// observe the notify() call inside reserveN as a synchronization point.
+	group := &rmpb.ResourceGroup{
+		Name: "test",
+		Mode: rmpb.GroupMode_RUMode,
+		RUSettings: &rmpb.GroupRequestUnitSettings{
+			RU: &rmpb.TokenBucket{
+				Settings: &rmpb.TokenLimitSettings{FillRate: 1000},
+			},
+		},
+	}
+	notifyCh := make(chan notifyMsg, 1)
+	cfg := DefaultRUConfig()
+	cfg.WaitRetryInterval = 5 * time.Second
+	cfg.WaitRetryTimes = 3
+	gc, err := newGroupCostController(group, cfg, notifyCh, make(chan *groupCostController, 1))
+	re.NoError(err)
+
+	// Set fillRate=0 so reservation always fails with InfDuration,
+	// which is the exact scenario described in issue #10251.
+	counter := gc.run.requestUnitTokens[rmpb.RequestUnitType_RU]
+	counter.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		NewTokens: 1000,
+		NewRate:   0,
+		NewBurst:  0,
+	})
+
+	delta := &rmpb.Consumption{RRU: 5000}
+	type acquireResult struct {
+		err          error
+		waitDuration time.Duration
+	}
+	resultCh := make(chan acquireResult, 1)
+	go func() {
+		var waitDuration time.Duration
+		_, err := gc.acquireTokens(context.Background(), delta, &waitDuration, false)
+		resultCh <- acquireResult{err, waitDuration}
+	}()
+
+	// Wait for notify — Reserve has failed and the retry path is entered.
+	select {
+	case <-notifyCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for low-RU notification")
+	}
+
+	// Now reconfigure with enough tokens and a real fillRate.
+	// This closes the reconfiguredCh (waking the select) and provides
+	// tokens so the next Reserve() succeeds.
+	counter.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		NewTokens: 100000,
+		NewRate:   100000,
+		NewBurst:  0,
+	})
+
+	select {
+	case r := <-resultCh:
+		re.NoError(r.err)
+		re.Less(r.waitDuration, cfg.WaitRetryInterval)
+	case <-time.After(cfg.WaitRetryInterval):
+		t.Fatal("acquireTokens was not woken up promptly by Reconfigure signal")
+	}
+}
+
+func TestAcquireTokensFallbackToTimer(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+	// Short retry interval so the test runs fast.
+	gc.mainCfg.WaitRetryInterval = 50 * time.Millisecond
+	gc.mainCfg.WaitRetryTimes = 3
+	gc.mainCfg.LTBMaxWaitDuration = 100 * time.Millisecond
+
+	// Set fillRate=0 and never reconfigure — no signal will arrive.
+	counter := gc.run.requestUnitTokens[rmpb.RequestUnitType_RU]
+	counter.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{
+		NewTokens: 1000,
+		NewRate:   0,
+		NewBurst:  0,
+	})
+
+	delta := &rmpb.Consumption{RRU: 5000}
+	ctx := context.Background()
+	var waitDuration time.Duration
+	_, err := gc.acquireTokens(ctx, delta, &waitDuration, false)
+
+	// Without a Reconfigure signal, all retries should exhaust and return an error.
+	re.Error(err)
+	re.True(errs.ErrClientResourceGroupThrottled.Equal(err))
+	// waitDuration should be roughly retryTimes * retryInterval.
+	re.GreaterOrEqual(waitDuration, gc.mainCfg.WaitRetryInterval*time.Duration(gc.mainCfg.WaitRetryTimes))
+}
+
+// TestAcquireTokensCancelKeepsLastMonotonic checks that a stale CancelAt does
+// not rewind lim.last, exercised through two concurrent acquireTokens calls
+// pinned by the waitReservationsBeforeSelect failpoint: A reserves
+// (lim.last = now_A) and parks; B advances lim.last to now_B (> now_A); A is
+// then cancelled so CancelAt runs with the stale now_A. lim.last must stay at
+// now_B, not rewind to now_A.
+func TestAcquireTokensCancelKeepsLastMonotonic(t *testing.T) {
+	re := require.New(t)
+	gc := createTestGroupCostController(re)
+	gc.mainCfg.LTBMaxWaitDuration = 30 * time.Second
+	gc.mainCfg.WaitRetryTimes = 1
+	counter := gc.run.requestUnitTokens[rmpb.RequestUnitType_RU]
+
+	// Throttled bucket: a 10000-RU request reserves with a multi-second delay and
+	// parks in WaitReservations rather than being granted immediately.
+	counter.limiter.Reconfigure(time.Now(), tokenBucketReconfigureArgs{NewTokens: 0, NewRate: 1000, NewBurst: 0})
+
+	const fp = "github.com/tikv/pd/client/resource_group/controller/waitReservationsBeforeSelect"
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	re.NoError(failpoint.EnableCall(fp, func() {
+		reached <- struct{}{}
+		<-release
+	}))
+	defer func() { re.NoError(failpoint.Disable(fp)) }()
+
+	// A reserves with a delay and parks at the hook. Only A reaches the hook;
+	// the allowDebt sibling B never enters WaitReservations.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	resultCh := make(chan error, 1)
+	go func() {
+		var wd time.Duration
+		_, err := gc.acquireTokens(ctxA, &rmpb.Consumption{RRU: 10000}, &wd, false)
+		resultCh <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the request to reserve and park")
+	}
+	tMid := time.Now() // now_A < tMid <= now_B
+
+	// B advances lim.last to now_B via the allowDebt RemoveTokens path.
+	var wd time.Duration
+	_, err := gc.acquireTokens(context.Background(), &rmpb.Consumption{RRU: 1}, &wd, true)
+	re.NoError(err)
+
+	cancelA()
+	close(release)
+	select {
+	case err := <-resultCh:
+		re.Error(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for acquireTokens to return")
+	}
+
+	re.False(counter.limiter.last.Before(tMid), "stale CancelAt rewound lim.last")
 }
 
 // MockResourceGroupProvider is a mock implementation of the ResourceGroupProvider interface.
@@ -222,14 +456,19 @@ func (m *MockResourceGroupProvider) LoadResourceGroups(ctx context.Context) ([]*
 	return args.Get(0).([]*rmpb.ResourceGroup), args.Get(1).(int64), args.Error(2)
 }
 
-func (m *MockResourceGroupProvider) Watch(ctx context.Context, key []byte, opts ...pd.OpOption) (chan []*meta_storagepb.Event, error) {
+func (m *MockResourceGroupProvider) Watch(ctx context.Context, key []byte, opts ...opt.MetaStorageOption) (chan []*meta_storagepb.Event, error) {
 	args := m.Called(ctx, key, opts)
 	return args.Get(0).(chan []*meta_storagepb.Event), args.Error(1)
 }
 
-func (m *MockResourceGroupProvider) Get(ctx context.Context, key []byte, opts ...pd.OpOption) (*meta_storagepb.GetResponse, error) {
+func (m *MockResourceGroupProvider) Get(ctx context.Context, key []byte, opts ...opt.MetaStorageOption) (*meta_storagepb.GetResponse, error) {
 	args := m.Called(ctx, key, opts)
 	return args.Get(0).(*meta_storagepb.GetResponse), args.Error(1)
+}
+
+func (m *MockResourceGroupProvider) Put(ctx context.Context, key []byte, value []byte, opts ...opt.MetaStorageOption) (*meta_storagepb.PutResponse, error) {
+	args := m.Called(ctx, key, value, opts)
+	return args.Get(0).(*meta_storagepb.PutResponse), args.Error(1)
 }
 
 func TestControllerWithTwoGroupRequestConcurrency(t *testing.T) {
